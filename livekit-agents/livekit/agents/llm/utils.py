@@ -324,18 +324,20 @@ def function_arguments_to_pydantic_model(func: Callable[..., Any]) -> type[BaseM
             continue
 
         default_value = param.default if param.default is not param.empty else ...
-        field_info = Field()
 
         # Annotated[str, Field(description="...")]
         if get_origin(type_hint) is Annotated:
             annotated_args = get_args(type_hint)
             type_hint = annotated_args[0]
             field_info = next(
-                (x for x in annotated_args[1:] if isinstance(x, FieldInfo)), field_info
+                (x for x in annotated_args[1:] if isinstance(x, FieldInfo)), Field()
             )
+        else:
+            field_info = Field()
 
+        # Set default value in Field constructor to avoid Pydantic inferring wrong annotation
         if default_value is not ... and field_info.default is PydanticUndefined:
-            field_info.default = default_value
+            field_info = Field(default=default_value, description=field_info.description)
 
         if field_info.description is None:
             field_info.description = param_docs.get(param_name, None)
