@@ -161,17 +161,24 @@ class Boto3CredentialsResolver(IdentityResolver):  # type: ignore[misc]
     checks environment variables, shared credentials files, EC2 instance profiles, etc.
     The credentials are then wrapped in an AWSCredentialsIdentity so they can be
     passed into Bedrock runtime clients.
+    
+    Credentials are cached for 5 minutes to avoid excessive credential lookups.
     """
 
     def __init__(self) -> None:
         self.session = boto3.Session()  # type: ignore[attr-defined]
+        self._cached_identity: AWSCredentialsIdentity | None = None
+        self._cache_expiry: float = 0.0
+        self._cache_duration = 300.0  # 5 minutes in seconds
 
     async def get_identity(self, **kwargs: Any) -> AWSCredentialsIdentity:
-        """Asynchronously resolve AWS credentials.
+        """Asynchronously resolve AWS credentials with 5-minute caching.
 
         This method is invoked by the Bedrock runtime client whenever a new request needs to be
         signed.  It converts the static or temporary credentials returned by boto3
         into an AWSCredentialsIdentity instance.
+        
+        Credentials are cached for 5 minutes to reduce overhead from excessive lookups.
 
         Returns:
             AWSCredentialsIdentity: Identity containing the
@@ -180,8 +187,13 @@ class Boto3CredentialsResolver(IdentityResolver):  # type: ignore[misc]
         Raises:
             ValueError: If no credentials could be found by boto3.
         """
+        # Check if cached credentials are still valid
+        current_time = time.time()
+        if self._cached_identity and current_time < self._cache_expiry:
+            return self._cached_identity
+        
         try:
-            logger.debug("Attempting to load AWS credentials")
+            logger.debug("Loading AWS credentials (cache expired or empty)")
             credentials = self.session.get_credentials()
             if not credentials:
                 logger.error("Unable to load AWS credentials")
@@ -198,6 +210,11 @@ class Boto3CredentialsResolver(IdentityResolver):  # type: ignore[misc]
                 session_token=creds.token if creds.token else None,
                 expiration=None,
             )
+            
+            # Cache the credentials
+            self._cached_identity = identity
+            self._cache_expiry = current_time + self._cache_duration
+            
             return identity
         except Exception as e:
             logger.error(f"Failed to load AWS credentials: {str(e)}")
@@ -361,8 +378,8 @@ class RealtimeSession(  # noqa: F811
             endpoint_uri=f"https://bedrock-runtime.{self._realtime_model._opts.region}.amazonaws.com",
             region=self._realtime_model._opts.region,
             aws_credentials_identity_resolver=Boto3CredentialsResolver(),
-            http_auth_scheme_resolver=HTTPAuthSchemeResolver(),
-            http_auth_schemes={"aws.auth#sigv4": SigV4AuthScheme()},
+            auth_scheme_resolver=HTTPAuthSchemeResolver(),
+            auth_schemes={"aws.auth#sigv4": SigV4AuthScheme(service="bedrock")},
             user_agent_extra="x-client-framework:livekit-plugins-aws[realtime]",
         )
         self._bedrock_client = BedrockRuntimeClient(config=config)
