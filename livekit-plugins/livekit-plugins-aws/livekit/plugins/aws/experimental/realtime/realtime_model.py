@@ -96,6 +96,8 @@ class _RealtimeOptions:
         max_tokens (int): Maximum number of tokens the model may generate in a single response.
         tool_choice (llm.ToolChoice | None): Strategy that dictates how the model should invoke tools.
         region (str): AWS region hosting the Bedrock Sonic model endpoint.
+        output_audio_buffer_ms (int): Buffer output audio to this duration in ms (0 = no buffering).
+            Larger chunks can improve compatibility with SIP infrastructure. Set to 0 to use Bedrock's native chunks.
     """  # noqa: E501
 
     voice: VOICE_ID
@@ -104,6 +106,7 @@ class _RealtimeOptions:
     max_tokens: int
     tool_choice: llm.ToolChoice | None
     region: str
+    output_audio_buffer_ms: int = 200  # Default 200ms for SIP compatibility
 
 
 @dataclass
@@ -328,6 +331,14 @@ class RealtimeSession(  # noqa: F811
         self._instructions = DEFAULT_SYSTEM_PROMPT
         self._audio_input_chan = utils.aio.Chan[bytes]()
         self._current_generation: _ResponseGeneration | None = None
+        
+        # Buffer for output audio to create larger chunks for SIP compatibility
+        self._output_audio_buffer = bytearray()
+        self._output_buffer_target_ms = self._realtime_model._opts.output_audio_buffer_ms
+        
+        # Log buffering configuration at startup
+        if self._output_buffer_target_ms > 0:
+            logger.info(f"AWS audio output buffering enabled: {self._output_buffer_target_ms}ms target chunk size")
 
         self._event_handlers = {
             "completion_start": self._handle_completion_start_event,
@@ -826,18 +837,66 @@ class RealtimeSession(  # noqa: F811
         if content_type == "ASSISTANT_AUDIO":
             audio_content = event_data["event"]["audioOutput"]["content"]
             audio_bytes = base64.b64decode(audio_content)
-            self._current_generation.message_gen.audio_ch.send_nowait(
-                rtc.AudioFrame(
-                    data=audio_bytes,
-                    sample_rate=DEFAULT_OUTPUT_SAMPLE_RATE,
-                    num_channels=DEFAULT_CHANNELS,
-                    samples_per_channel=len(audio_bytes) // 2,
+            
+            # If buffering disabled (target_ms = 0), send immediately
+            if self._output_buffer_target_ms == 0:
+                samples = len(audio_bytes) // 2
+                self._current_generation.message_gen.audio_ch.send_nowait(
+                    rtc.AudioFrame(
+                        data=audio_bytes,
+                        sample_rate=DEFAULT_OUTPUT_SAMPLE_RATE,
+                        num_channels=DEFAULT_CHANNELS,
+                        samples_per_channel=samples,
+                    )
                 )
-            )
+                return
+            
+            # Buffer audio to create larger chunks
+            self._output_audio_buffer.extend(audio_bytes)
+            
+            # Calculate target buffer size for desired duration
+            target_samples = int((self._output_buffer_target_ms / 1000) * DEFAULT_OUTPUT_SAMPLE_RATE)
+            target_bytes = target_samples * 2  # 16-bit samples
+            
+            # Send buffered chunks when we reach target size
+            while len(self._output_audio_buffer) >= target_bytes:
+                chunk_bytes = bytes(self._output_audio_buffer[:target_bytes])
+                self._output_audio_buffer = self._output_audio_buffer[target_bytes:]
+                
+                chunk_samples = len(chunk_bytes) // 2
+                chunk_duration_ms = (chunk_samples / DEFAULT_OUTPUT_SAMPLE_RATE) * 1000
+                logger.debug(f"AWS audio chunk (buffered): {len(chunk_bytes)} bytes, {chunk_samples} samples, {chunk_duration_ms:.1f}ms")
+                
+                self._current_generation.message_gen.audio_ch.send_nowait(
+                    rtc.AudioFrame(
+                        data=chunk_bytes,
+                        sample_rate=DEFAULT_OUTPUT_SAMPLE_RATE,
+                        num_channels=DEFAULT_CHANNELS,
+                        samples_per_channel=chunk_samples,
+                    )
+                )
 
     async def _handle_audio_output_content_end_event(self, event_data: dict) -> None:
-        """Handle audio content end - log but don't close generation."""
+        """Handle audio content end - flush any remaining buffered audio."""
         log_event_data(event_data)
+        
+        # Flush any remaining buffered audio
+        if self._current_generation and self._current_generation.message_gen and len(self._output_audio_buffer) > 0:
+            chunk_bytes = bytes(self._output_audio_buffer)
+            self._output_audio_buffer.clear()
+            
+            chunk_samples = len(chunk_bytes) // 2
+            chunk_duration_ms = (chunk_samples / DEFAULT_OUTPUT_SAMPLE_RATE) * 1000
+            logger.debug(f"AWS audio chunk (flush): {len(chunk_bytes)} bytes, {chunk_samples} samples, {chunk_duration_ms:.1f}ms")
+            
+            self._current_generation.message_gen.audio_ch.send_nowait(
+                rtc.AudioFrame(
+                    data=chunk_bytes,
+                    sample_rate=DEFAULT_OUTPUT_SAMPLE_RATE,
+                    num_channels=DEFAULT_CHANNELS,
+                    samples_per_channel=chunk_samples,
+                )
+            )
         # Nova Sonic uses one completion for entire session
         # Don't close generation here - wait for new completionStart or session end
 
